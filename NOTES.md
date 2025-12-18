@@ -11,6 +11,12 @@ GPU=$(python -c "import torch; print(torch.cuda.device_count())")
 torchrun --standalone --nproc_per_node=$GPU train_gpt_adam.py --run_name "baseline_adamw"
 ```
 
+```
+export WANDB_MODE="online"
+GPU=$(python -c "import torch; print(torch.cuda.device_count())")
+torchrun --standalone --nproc_per_node=$GPU train_gpt_muon.py --run_name "debug_muon"
+```
+
 ## Code Style
 
 ### Pre-commit Requirements
