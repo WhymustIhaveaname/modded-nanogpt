@@ -54,33 +54,136 @@ SEED = 42
 # MP spectrum v2: 3.32 -5.37
 
 # -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+
+def build_data(args, ddp_rank, ddp_world_size):
+    """Build train and validation data loaders."""
+    train_loader = DistributedDataLoader(TRAIN_FILES, B, T, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(VAL_FILES, B, T, ddp_rank, ddp_world_size)
+    return train_loader, val_loader
+
+
+def build_model(args, ddp_local_rank):
+    """Build and compile model with DDP."""
+    model_config = GPTConfig(vocab_size=50257, n_layer=12, n_head=12, n_embd=768)
+    model = GPT(model_config)
+    model = model.train().cuda()
+
+    if hasattr(config, "coordinate_descent_tuning"):
+        config.coordinate_descent_tuning = True
+    print0("Compiling model...")
+    model = torch.compile(model)
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+    return model
+
+
+def build_optimizer_and_scheduler(args, model):
+    """Build optimizers and LR scheduler."""
+    raw_model = model.module
+    ns_coeffs = (args.ns_a, args.ns_b, 0.701 - args.ns_a - args.ns_b)
+    learning_rate = args.lr
+    muon_lr = 0.1 * learning_rate
+    decay_start = args.decay_start
+
+    # Optimizers: AdamW for lm_head (wd=0), Muon for transformer blocks (wd=1.2)
+    optimizer_adamw = torch.optim.AdamW(
+        raw_model.lm_head.parameters(),
+        lr=learning_rate,
+        betas=(0.9, 0.95),
+        weight_decay=0.0,
+        fused=True,
+    )
+    optimizer_muon = Muon(
+        raw_model.transformer.h.parameters(),
+        lr=muon_lr,
+        momentum=0.95,
+        ns_coeffs=ns_coeffs,
+        weight_decay=1.2,
+    )
+    optimizers = [optimizer_adamw, optimizer_muon]
+    base_lrs = [learning_rate, muon_lr]
+
+    # LR schedule: constant + linear decay to 0
+    def get_lr_scale(step):
+        if step < decay_start:
+            return 1.0
+        else:
+            return (NUM_ITERATIONS - step) / (NUM_ITERATIONS - decay_start)
+
+    return optimizers, base_lrs, get_lr_scale
+
+
+def validate(model, val_loader, ctx):
+    model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+        val_loss = 0.0
+        for _ in range(VAL_MAX_STEPS):
+            x_val, y_val = val_loader.next_batch()
+            with ctx:
+                _, loss = model(x_val, y_val)
+            val_loss += loss
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss = val_loss.item() / VAL_MAX_STEPS
+    return val_loss
+
+
+def train_one_step(
+    model, train_loader, optimizers, base_lrs, lr_scale, grad_accum_steps, ctx
+):
+    """Execute one training step with gradient accumulation."""
+    model.train()
+    train_loss = 0.0
+    x, y = train_loader.next_batch()
+
+    for micro_step in range(grad_accum_steps):
+        with ctx:
+            _, loss = model(x, y)
+        train_loss += loss.detach()
+        if micro_step < grad_accum_steps - 1:
+            x, y = train_loader.next_batch()
+            with model.no_sync():
+                (loss / grad_accum_steps).backward()
+        else:
+            (loss / grad_accum_steps).backward()
+    train_loss /= grad_accum_steps
+
+    # Compute gradient norm before optimizer step
+    grad_norm = (
+        sum(p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+    )
+
+    # Update learning rates and step
+    for opt, base_lr in zip(optimizers, base_lrs):
+        opt.param_groups[0]["lr"] = base_lr * lr_scale
+        opt.step()
+
+    for opt in optimizers:
+        opt.zero_grad(set_to_none=True)
+
+    return train_loss, grad_norm
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, required=True, help="run name prefix")
-    parser.add_argument(
-        "--ns_a", type=float, default=float(os.environ.get("NS_A", 3.4445))
-    )
-    parser.add_argument(
-        "--ns_b", type=float, default=float(os.environ.get("NS_B", -4.7750))
-    )
-    parser.add_argument("--lr", type=float, default=float(os.environ.get("LR", 0.0036)))
-    # parser.add_argument("--decay_start", type=int, default=int(os.environ.get("DECAY_START", 4400)))
-    parser.add_argument("--L0", type=float, default=float(os.environ.get("L0", 4.0)))
+    parser.add_argument("--ns_a", type=float, default=3.4445)
+    parser.add_argument("--ns_b", type=float, default=-4.7750)
+    parser.add_argument("--lr", type=float, default=0.0036)
+    parser.add_argument("--decay_start", type=int, default=4000)  # was 4400
     args = parser.parse_args()
 
-    ns_a, ns_b = args.ns_a, args.ns_b
-    ns_c = 0.701 - ns_a - ns_b
-    learning_rate = args.lr
-    # decay_start = args.decay_start
-    L0 = args.L0
-    muon_lr = 0.1 * learning_rate
-
-    # Auto-generate run_name
-    run_name = (
-        f"{args.run_name}_a{ns_a:.3f}_b{ns_b:.3f}_lr{learning_rate:.4f}_L0{L0:.1f}"
+    # Derived values
+    args.ns_c = 0.701 - args.ns_a - args.ns_b
+    args.run_name_full = (
+        f"{args.run_name}_a{args.ns_a:.3f}_b{args.ns_b:.3f}_lr{args.lr:.4f}"
     )
 
     # DDP setup
@@ -95,9 +198,9 @@ if __name__ == "__main__":
 
     print0(f"Running pytorch {torch.version.__version__}")
     print0(f"World size: {ddp_world_size}")
-    print0(f"NS coefficients: a={ns_a}, b={ns_b}, c={ns_c}")
-    print0(f"Learning rate: {learning_rate}, Muon LR: {muon_lr}")
-    print0(f"Run name: {run_name}")
+    print0(f"NS coefficients: a={args.ns_a}, b={args.ns_b}, c={args.ns_c}")
+    print0(f"Learning rate: {args.lr}")
+    print0(f"Run name: {args.run_name_full}")
 
     # Set random seeds for reproducibility
     set_seed(SEED)
@@ -111,54 +214,9 @@ if __name__ == "__main__":
     # Mixed precision context
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    # Data loaders
-    train_loader = DistributedDataLoader(TRAIN_FILES, B, T, ddp_rank, ddp_world_size)
-    val_loader = DistributedDataLoader(VAL_FILES, B, T, ddp_rank, ddp_world_size)
-
-    # Model
-    model_config = GPTConfig(vocab_size=50257, n_layer=12, n_head=12, n_embd=768)
-    model = GPT(model_config)
-    model = model.train().cuda()
-
-    if hasattr(config, "coordinate_descent_tuning"):
-        config.coordinate_descent_tuning = True
-    print0("Compiling model...")
-    model = torch.compile(model)
-    model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module
-
-    # Optimizers: AdamW for lm_head (wd=0), Muon for transformer blocks (wd=1.2)
-    optimizer_adamw = torch.optim.AdamW(
-        raw_model.lm_head.parameters(),
-        lr=learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=0.0,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        raw_model.transformer.h.parameters(),
-        lr=muon_lr,
-        momentum=0.95,
-        ns_coeffs=(ns_a, ns_b, ns_c),
-        weight_decay=1.2,
-    )
-    optimizers = [optimizer_adamw, optimizer_muon]
-    base_lrs = [learning_rate, muon_lr]
-
-    # # LR schedule: constant + linear decay to 0 (ORIGINAL - commented out for experiment)
-    # def get_lr_scale(step):
-    #     if step < decay_start:
-    #         return 1.0
-    #     else:
-    #         return (NUM_ITERATIONS - step) / (NUM_ITERATIONS - decay_start)
-
-    # LR schedule: loss-based (EXPERIMENTAL)
-    # lr ∝ L^(1/0.21), capped at lr0 when L >= L0
-    def get_lr_from_loss(current_loss, lr0, L0):
-        if current_loss is None or current_loss >= L0:
-            return lr0
-        else:
-            return lr0 * (current_loss / L0) ** (1 / 0.21)
+    train_loader, val_loader = build_data(args, ddp_rank, ddp_world_size)
+    model = build_model(args, ddp_local_rank)
+    optimizers, base_lrs, get_lr_scale = build_optimizer_and_scheduler(args, model)
 
     # Logging
     run_id = str(uuid.uuid4())
@@ -167,51 +225,39 @@ if __name__ == "__main__":
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{run_id}.log"
         print0(f"Logging to {logfile}")
+        # Get actual values from optimizers for logging
+        adamw_lr = optimizers[0].param_groups[0]["lr"]
+        muon_lr = optimizers[1].param_groups[0]["lr"]
+        muon_wd = optimizers[1].param_groups[0]["weight_decay"]
         wandb.init(
             project="muon",
-            name=run_name,
+            name=args.run_name_full,
             config={
                 "batch_size": B,
                 "sequence_length": T,
                 "total_batch_size": TOTAL_BATCH_SIZE,
-                "learning_rate": learning_rate,
+                "learning_rate": adamw_lr,
                 "muon_lr": muon_lr,
-                # "decay_start": decay_start,
-                "L0": L0,
-                "muon_weight_decay": 1.2,
+                "decay_start": args.decay_start,
+                "muon_weight_decay": muon_wd,
                 "num_iterations": NUM_ITERATIONS,
                 "grad_accum_steps": grad_accum_steps,
                 "world_size": ddp_world_size,
                 "seed": SEED,
-                "ns_a": ns_a,
-                "ns_b": ns_b,
-                "ns_c": ns_c,
+                "ns_a": args.ns_a,
+                "ns_b": args.ns_b,
+                "ns_c": args.ns_c,
             },
         )
 
-    # Pre-fetch first batch
-    x, y = train_loader.next_batch()
-
     # Training loop
     start_time = time.time()
-    prev_loss = None  # For loss-based LR scheduling
     for step in range(NUM_ITERATIONS + 1):
         t0 = time.time()
         last_step = step == NUM_ITERATIONS
 
-        # Validation
         if (VAL_LOSS_EVERY > 0 and step % VAL_LOSS_EVERY == 0) or last_step:
-            model.eval()
-            val_loader.reset()
-            with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(VAL_MAX_STEPS):
-                    x_val, y_val = val_loader.next_batch()
-                    with ctx:
-                        _, loss = model(x_val, y_val)
-                    val_loss += loss
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                val_loss = val_loss.item() / VAL_MAX_STEPS
+            val_loss = validate(model, val_loader, ctx)
             print0(f"step {step} | val loss {val_loss:.6f}")
             if master_process:
                 if logfile:
@@ -222,44 +268,12 @@ if __name__ == "__main__":
         if last_step:
             break
 
-        # Training step with gradient accumulation
-        model.train()
-        train_loss = 0.0
-        for micro_step in range(grad_accum_steps):
-            with ctx:
-                _, loss = model(x, y)
-            train_loss += loss.detach()
-            x, y = train_loader.next_batch()
-            if micro_step < grad_accum_steps - 1:
-                with model.no_sync():
-                    (loss / grad_accum_steps).backward()
-            else:
-                (loss / grad_accum_steps).backward()
-        train_loss /= grad_accum_steps
-
-        # Compute gradient norm before optimizer step
-        grad_norm = (
-            sum(p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None)
-            ** 0.5
+        # Training step
+        lr_scale = get_lr_scale(step)
+        current_lr = args.lr * lr_scale
+        train_loss, grad_norm = train_one_step(
+            model, train_loader, optimizers, base_lrs, lr_scale, grad_accum_steps, ctx
         )
-
-        # Update learning rates and step
-        # # ORIGINAL: step-based lr schedule
-        # lr_scale = get_lr_scale(step)
-        # for opt, base_lr in zip(optimizers, base_lrs):
-        #     opt.param_groups[0]['lr'] = base_lr * lr_scale
-        #     opt.step()
-
-        # EXPERIMENTAL: loss-based lr schedule
-        current_lr = get_lr_from_loss(prev_loss, learning_rate, L0)
-        current_muon_lr = 0.1 * current_lr
-        optimizer_adamw.param_groups[0]["lr"] = current_lr
-        optimizer_muon.param_groups[0]["lr"] = current_muon_lr
-        for opt in optimizers:
-            opt.step()
-
-        for opt in optimizers:
-            opt.zero_grad(set_to_none=True)
 
         torch.cuda.synchronize()
         t1 = time.time()
@@ -269,7 +283,6 @@ if __name__ == "__main__":
         if math.isnan(lossf):
             print0(f"step {step} | loss is NaN, stopping training")
             break
-        prev_loss = lossf  # Update prev_loss for next step
         print0(
             f"step {step:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | lr {current_lr:.2e} | {(t1 - t0) * 1000:.1f}ms"
         )
