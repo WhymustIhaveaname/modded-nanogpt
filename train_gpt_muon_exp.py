@@ -1,35 +1,19 @@
 """
-Reproduces Muon optimizer record from 2024-10-11.
-Based on commit b356a1f.
+Experimental Muon training script with configurable Newton-Schulz coefficients.
 
-Muon uses Newton-Schulz iteration to orthogonalize the gradient updates
-for transformer block parameters, while using AdamW for embedding/lm_head.
-
-Expected first few losses (from records/track_1_short/2024-10-10_Muon, 8 GPU):
-  step:0  val_loss:10.9264
-  step:1  train_loss:10.9184
-  step:2  train_loss:8.6834
-  step:3  train_loss:7.7596
-  step:4  train_loss:7.5281
-  step:5  train_loss:7.2838
-
-Actual results (4 GPU + grad_accum=2, 2025-12-18, avg of 2 runs):
-  step 0 | val loss 10.98645 | train loss 10.98884
-  step 1 | train loss 9.08150 ± 0.00002
-  step 2 | train loss 7.77348 ± 0.00010
-  step 3 | train loss 7.39948 ± 0.00020
-  step 4 | train loss 7.35630 ± 0.00019
-  step 5 | train loss 7.26357 ± 0.00033
-
-Note: Differences from original due to different random seed and grad_accum.
+Differences from train_gpt_muon.py:
+1. abc (Newton-Schulz coefficients) configurable via --ns_a, --ns_b, --ns_c or NS_A, NS_B, NS_C env vars
+2. LR schedule: constant + linear decay to 0, with configurable --decay_start
+3. run_name auto-generated to reflect abc and lr
 
 Run with:
-  torchrun --standalone --nproc_per_node=8 train_gpt_muon.py --run_name "muon_baseline"
+  torchrun --standalone --nproc_per_node=8 train_gpt_muon_exp.py --ns_a 3.4445 --ns_b -4.7750 --ns_c 2.0315
 """
 import os
 import uuid
 import argparse
 import time
+import math
 
 import torch
 import wandb
@@ -40,22 +24,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from train_gpt_adam import GPT, GPTConfig, DistributedDataLoader, print0
 
 # -----------------------------------------------------------------------------
-# Hyperparameters (matching the 2024-10-11 Muon record)
+# Hyperparameters
 # -----------------------------------------------------------------------------
 B = 64                    # batch size per GPU
 T = 1024                  # sequence length
 TOTAL_BATCH_SIZE = 8 * 64 * 1024  # total tokens per step
 NUM_ITERATIONS = 6200     # total training steps
-LEARNING_RATE = 0.0036    # AdamW learning rate
-MUON_LR = 0.1 * LEARNING_RATE  # Muon learning rate
-WARMUP_ITERS = 0
-WARMDOWN_ITERS = 1800
-WEIGHT_DECAY = 0
 VAL_LOSS_EVERY = 125
 VAL_MAX_STEPS = 20
 
-# Newton-Schulz coefficients
-NS_COEFFS = (3.4445, -4.7750, 2.0315)
+# Newton-Schulz defaults
 NS_STEPS = 5
 
 # Data paths
@@ -65,46 +43,54 @@ VAL_FILES = "data/fineweb10B/fineweb_val_*.bin"
 # Reproducibility
 SEED = 42
 
+
+# my Note -- possible ab to try, c=0.701-a-b
+# Jordan: 3.4445 -4.7750
+# uniform spectrum: 3.577 -4.912
+# power spectrum: 3.565 -5.225
+# power spectrum: 3.15  -4.5
+# MP spectrum (1280): 3.55 -5.34
+# MP spectrum (768): 3.55 -5.35
+# MP spectrum v2: 3.32 -5.37
+
+
 # -----------------------------------------------------------------------------
-# Muon Optimizer
+# Muon Optimizer (with configurable coefficients)
 # -----------------------------------------------------------------------------
 
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps=NS_STEPS, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
-    """
-    assert len(G.shape) == 2
-    a, b, c = NS_COEFFS
-    X = G.bfloat16() / (G.norm() + eps)
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X.to(G.dtype)
+def make_zeropower_fn(ns_a, ns_b, ns_c):
+    """Create a compiled Newton-Schulz function with given coefficients."""
+    @torch.compile
+    def zeropower_via_newtonschulz5(G, steps=NS_STEPS, eps=1e-7):
+        assert len(G.shape) == 2
+        a, b, c = ns_a, ns_b, ns_c
+        X = G.bfloat16() / (G.norm() + eps)
+        if G.size(0) > G.size(1):
+            X = X.T
+        for _ in range(steps):
+            A = X @ X.T
+            B = A @ X
+            X = a * X + b * B + c * A @ B
+        if G.size(0) > G.size(1):
+            X = X.T
+        return X.to(G.dtype)
+    return zeropower_via_newtonschulz5
 
 
 class Muon(torch.optim.Optimizer):
     """
     Muon: MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
     """
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend_steps=NS_STEPS):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend_steps=backend_steps)
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0, backend_steps=NS_STEPS, zeropower_fn=None):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, backend_steps=backend_steps)
         super().__init__(params, defaults)
+        self.zeropower_fn = zeropower_fn
 
     def step(self):
         for group in self.param_groups:
             lr = group['lr']
             momentum = group['momentum']
+            wd = group['weight_decay']
             for p in group['params']:
                 g = p.grad
                 if g is None:
@@ -118,12 +104,15 @@ class Muon(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 # Handle grouped QKV parameters
                 if g.size(0) == 3 * g.size(1):
-                    g = torch.cat([zeropower_via_newtonschulz5(g1, steps=group['backend_steps'])
+                    g = torch.cat([self.zeropower_fn(g1, steps=group['backend_steps'])
                                    for g1 in g.split(g.size(1))])
                     scale = g.size(1)**0.5
                 else:
-                    g = zeropower_via_newtonschulz5(g, steps=group['backend_steps'])
+                    g = self.zeropower_fn(g, steps=group['backend_steps'])
                     scale = max(g.size(0), g.size(1))**0.5
+                # Weight decay (decoupled)
+                if wd != 0:
+                    p.data.mul_(1 - lr * wd)
                 p.data.add_(g, alpha=-lr * scale)
 
 
@@ -133,8 +122,23 @@ class Muon(torch.optim.Optimizer):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run_name", type=str, required=True, help="wandb run name")
+    parser.add_argument("--run_name", type=str, required=True, help="run name prefix")
+    parser.add_argument("--ns_a", type=float, default=float(os.environ.get("NS_A", 3.4445)))
+    parser.add_argument("--ns_b", type=float, default=float(os.environ.get("NS_B", -4.7750)))
+    parser.add_argument("--lr", type=float, default=float(os.environ.get("LR", 0.0036)))
+    # parser.add_argument("--decay_start", type=int, default=int(os.environ.get("DECAY_START", 4400)))
+    parser.add_argument("--L0", type=float, default=float(os.environ.get("L0", 4.0)))
     args = parser.parse_args()
+
+    ns_a, ns_b = args.ns_a, args.ns_b
+    ns_c = 0.701 - ns_a - ns_b
+    learning_rate = args.lr
+    # decay_start = args.decay_start
+    L0 = args.L0
+    muon_lr = 0.1 * learning_rate
+
+    # Auto-generate run_name
+    run_name = f"{args.run_name}_a{ns_a:.3f}_b{ns_b:.3f}_lr{learning_rate:.4f}_L0{L0:.1f}"
 
     # DDP setup
     assert torch.cuda.is_available()
@@ -148,6 +152,9 @@ if __name__ == "__main__":
 
     print0(f"Running pytorch {torch.version.__version__}")
     print0(f"World size: {ddp_world_size}")
+    print0(f"NS coefficients: a={ns_a}, b={ns_b}, c={ns_c}")
+    print0(f"Learning rate: {learning_rate}, Muon LR: {muon_lr}")
+    print0(f"Run name: {run_name}")
 
     # Set random seeds for reproducibility
     torch.manual_seed(SEED)
@@ -178,30 +185,41 @@ if __name__ == "__main__":
     model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module
 
-    # Optimizers: AdamW for lm_head, Muon for transformer blocks
+    # Create zeropower function with configurable coefficients
+    zeropower_fn = make_zeropower_fn(ns_a, ns_b, ns_c)
+
+    # Optimizers: AdamW for lm_head (wd=0), Muon for transformer blocks (wd=1.2)
     optimizer_adamw = torch.optim.AdamW(
         raw_model.lm_head.parameters(),
-        lr=LEARNING_RATE,
+        lr=learning_rate,
         betas=(0.9, 0.95),
-        weight_decay=WEIGHT_DECAY,
+        weight_decay=0.0,
         fused=True
     )
     optimizer_muon = Muon(
         raw_model.transformer.h.parameters(),
-        lr=MUON_LR,
-        momentum=0.95
+        lr=muon_lr,
+        momentum=0.95,
+        weight_decay=1.2,
+        zeropower_fn=zeropower_fn
     )
     optimizers = [optimizer_adamw, optimizer_muon]
-    base_lrs = [LEARNING_RATE, MUON_LR]
+    base_lrs = [learning_rate, muon_lr]
 
-    # LR schedule: warmup -> constant -> warmdown
-    def get_lr_scale(step):
-        if step < WARMUP_ITERS:
-            return (step + 1) / WARMUP_ITERS
-        elif step < NUM_ITERATIONS - WARMDOWN_ITERS:
-            return 1.0
+    # # LR schedule: constant + linear decay to 0 (ORIGINAL - commented out for experiment)
+    # def get_lr_scale(step):
+    #     if step < decay_start:
+    #         return 1.0
+    #     else:
+    #         return (NUM_ITERATIONS - step) / (NUM_ITERATIONS - decay_start)
+
+    # LR schedule: loss-based (EXPERIMENTAL)
+    # lr ∝ L^(1/0.21), capped at lr0 when L >= L0
+    def get_lr_from_loss(current_loss, lr0, L0):
+        if current_loss is None or current_loss >= L0:
+            return lr0
         else:
-            return (NUM_ITERATIONS - step) / WARMDOWN_ITERS
+            return lr0 * (current_loss / L0) ** (1 / 0.21)
 
     # Logging
     run_id = str(uuid.uuid4())
@@ -212,20 +230,23 @@ if __name__ == "__main__":
         print0(f"Logging to {logfile}")
         wandb.init(
             project="muon",
-            name=args.run_name,
+            name=run_name,
             config={
                 "batch_size": B,
                 "sequence_length": T,
                 "total_batch_size": TOTAL_BATCH_SIZE,
-                "learning_rate": LEARNING_RATE,
-                "muon_lr": MUON_LR,
-                "warmup_iters": WARMUP_ITERS,
-                "warmdown_iters": WARMDOWN_ITERS,
-                "weight_decay": WEIGHT_DECAY,
+                "learning_rate": learning_rate,
+                "muon_lr": muon_lr,
+                # "decay_start": decay_start,
+                "L0": L0,
+                "muon_weight_decay": 1.2,
                 "num_iterations": NUM_ITERATIONS,
                 "grad_accum_steps": grad_accum_steps,
                 "world_size": ddp_world_size,
                 "seed": SEED,
+                "ns_a": ns_a,
+                "ns_b": ns_b,
+                "ns_c": ns_c,
             }
         )
 
@@ -234,6 +255,7 @@ if __name__ == "__main__":
 
     # Training loop
     start_time = time.time()
+    prev_loss = None  # For loss-based LR scheduling
     for step in range(NUM_ITERATIONS + 1):
         t0 = time.time()
         last_step = (step == NUM_ITERATIONS)
@@ -280,10 +302,20 @@ if __name__ == "__main__":
         grad_norm = sum(p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
 
         # Update learning rates and step
-        lr_scale = get_lr_scale(step)
-        for opt, base_lr in zip(optimizers, base_lrs):
-            opt.param_groups[0]['lr'] = base_lr * lr_scale
+        # # ORIGINAL: step-based lr schedule
+        # lr_scale = get_lr_scale(step)
+        # for opt, base_lr in zip(optimizers, base_lrs):
+        #     opt.param_groups[0]['lr'] = base_lr * lr_scale
+        #     opt.step()
+
+        # EXPERIMENTAL: loss-based lr schedule
+        current_lr = get_lr_from_loss(prev_loss, learning_rate, L0)
+        current_muon_lr = 0.1 * current_lr
+        optimizer_adamw.param_groups[0]['lr'] = current_lr
+        optimizer_muon.param_groups[0]['lr'] = current_muon_lr
+        for opt in optimizers:
             opt.step()
+
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
@@ -292,8 +324,10 @@ if __name__ == "__main__":
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()
-
-        current_lr = LEARNING_RATE * lr_scale
+        if math.isnan(lossf):
+            print0(f"step {step} | loss is NaN, stopping training")
+            break
+        prev_loss = lossf  # Update prev_loss for next step
         print0(f"step {step:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | lr {current_lr:.2e} | {(t1-t0)*1000:.1f}ms")
         if master_process:
             if logfile:
