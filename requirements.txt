@@ -1,6 +1,8 @@
 numpy
 tqdm
-torch
 huggingface-hub
 kernels
 setuptools
+pre-commit
+typing_extensions
+wandb

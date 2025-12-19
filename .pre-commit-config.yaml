@@ -1,0 +1,20 @@
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+    -   id: check-ast                     # 检查 Python 语法
+    -   id: check-added-large-files       # 阻止提交大文件
+        args: ['--maxkb=250']
+    -   id: check-merge-conflict          # 检查合并冲突标记
+    -   id: check-yaml                    # 检查 YAML 语法
+    -   id: debug-statements              # 检测遗留的 pdb 语句
+    -   id: end-of-file-fixer             # 确保文件以换行符结尾
+    -   id: trailing-whitespace           # 删除行尾空白
+        args: [--markdown-linebreak-ext=md]
+
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.1
+    hooks:
+    -   id: ruff
+        args: [--fix]
+    -   id: ruff-format

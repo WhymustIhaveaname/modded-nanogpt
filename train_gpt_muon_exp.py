@@ -9,6 +9,7 @@ Differences from train_gpt_muon.py:
 Run with:
   torchrun --standalone --nproc_per_node=8 train_gpt_muon_exp.py --ns_a 3.4445 --ns_b -4.7750 --ns_c 2.0315
 """
+
 import os
 import uuid
 import argparse
@@ -21,20 +22,20 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from train_gpt_adam import GPT, GPTConfig, DistributedDataLoader, print0
+from nanogpt.model.gpt import GPT, GPTConfig
+from nanogpt.data.distributed_loader import DistributedDataLoader
+from nanogpt.optimizer.muon import Muon
+from nanogpt.utils import print0, set_seed
 
 # -----------------------------------------------------------------------------
 # Hyperparameters
 # -----------------------------------------------------------------------------
-B = 64                    # batch size per GPU
-T = 1024                  # sequence length
+B = 64  # batch size per GPU
+T = 1024  # sequence length
 TOTAL_BATCH_SIZE = 8 * 64 * 1024  # total tokens per step
-NUM_ITERATIONS = 6200     # total training steps
+NUM_ITERATIONS = 6200  # total training steps
 VAL_LOSS_EVERY = 125
 VAL_MAX_STEPS = 20
-
-# Newton-Schulz defaults
-NS_STEPS = 5
 
 # Data paths
 TRAIN_FILES = "data/fineweb10B/fineweb_train_*.bin"
@@ -42,7 +43,6 @@ VAL_FILES = "data/fineweb10B/fineweb_val_*.bin"
 
 # Reproducibility
 SEED = 42
-
 
 # my Note -- possible ab to try, c=0.701-a-b
 # Jordan: 3.4445 -4.7750
@@ -53,69 +53,6 @@ SEED = 42
 # MP spectrum (768): 3.55 -5.35
 # MP spectrum v2: 3.32 -5.37
 
-
-# -----------------------------------------------------------------------------
-# Muon Optimizer (with configurable coefficients)
-# -----------------------------------------------------------------------------
-
-def make_zeropower_fn(ns_a, ns_b, ns_c):
-    """Create a compiled Newton-Schulz function with given coefficients."""
-    @torch.compile
-    def zeropower_via_newtonschulz5(G, steps=NS_STEPS, eps=1e-7):
-        assert len(G.shape) == 2
-        a, b, c = ns_a, ns_b, ns_c
-        X = G.bfloat16() / (G.norm() + eps)
-        if G.size(0) > G.size(1):
-            X = X.T
-        for _ in range(steps):
-            A = X @ X.T
-            B = A @ X
-            X = a * X + b * B + c * A @ B
-        if G.size(0) > G.size(1):
-            X = X.T
-        return X.to(G.dtype)
-    return zeropower_via_newtonschulz5
-
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon: MomentUm Orthogonalized by Newton-schulz
-    """
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, weight_decay=0.0, backend_steps=NS_STEPS, zeropower_fn=None):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, backend_steps=backend_steps)
-        super().__init__(params, defaults)
-        self.zeropower_fn = zeropower_fn
-
-    def step(self):
-        for group in self.param_groups:
-            lr = group['lr']
-            momentum = group['momentum']
-            wd = group['weight_decay']
-            for p in group['params']:
-                g = p.grad
-                if g is None:
-                    continue
-                state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
-                buf.mul_(momentum).add_(g)
-                if group['nesterov']:
-                    g = g.add(buf, alpha=momentum)
-                # Handle grouped QKV parameters
-                if g.size(0) == 3 * g.size(1):
-                    g = torch.cat([self.zeropower_fn(g1, steps=group['backend_steps'])
-                                   for g1 in g.split(g.size(1))])
-                    scale = g.size(1)**0.5
-                else:
-                    g = self.zeropower_fn(g, steps=group['backend_steps'])
-                    scale = max(g.size(0), g.size(1))**0.5
-                # Weight decay (decoupled)
-                if wd != 0:
-                    p.data.mul_(1 - lr * wd)
-                p.data.add_(g, alpha=-lr * scale)
-
-
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -123,8 +60,12 @@ class Muon(torch.optim.Optimizer):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, required=True, help="run name prefix")
-    parser.add_argument("--ns_a", type=float, default=float(os.environ.get("NS_A", 3.4445)))
-    parser.add_argument("--ns_b", type=float, default=float(os.environ.get("NS_B", -4.7750)))
+    parser.add_argument(
+        "--ns_a", type=float, default=float(os.environ.get("NS_A", 3.4445))
+    )
+    parser.add_argument(
+        "--ns_b", type=float, default=float(os.environ.get("NS_B", -4.7750))
+    )
     parser.add_argument("--lr", type=float, default=float(os.environ.get("LR", 0.0036)))
     # parser.add_argument("--decay_start", type=int, default=int(os.environ.get("DECAY_START", 4400)))
     parser.add_argument("--L0", type=float, default=float(os.environ.get("L0", 4.0)))
@@ -138,17 +79,19 @@ if __name__ == "__main__":
     muon_lr = 0.1 * learning_rate
 
     # Auto-generate run_name
-    run_name = f"{args.run_name}_a{ns_a:.3f}_b{ns_b:.3f}_lr{learning_rate:.4f}_L0{L0:.1f}"
+    run_name = (
+        f"{args.run_name}_a{ns_a:.3f}_b{ns_b:.3f}_lr{learning_rate:.4f}_L0{L0:.1f}"
+    )
 
     # DDP setup
     assert torch.cuda.is_available()
-    dist.init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+    dist.init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
-    master_process = (ddp_rank == 0)
+    master_process = ddp_rank == 0
 
     print0(f"Running pytorch {torch.version.__version__}")
     print0(f"World size: {ddp_world_size}")
@@ -157,8 +100,7 @@ if __name__ == "__main__":
     print0(f"Run name: {run_name}")
 
     # Set random seeds for reproducibility
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+    set_seed(SEED)
 
     # Calculate gradient accumulation steps to match total batch size
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -167,7 +109,7 @@ if __name__ == "__main__":
     print0(f"Gradient accumulation steps: {grad_accum_steps}")
 
     # Mixed precision context
-    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     # Data loaders
     train_loader = DistributedDataLoader(TRAIN_FILES, B, T, ddp_rank, ddp_world_size)
@@ -185,23 +127,20 @@ if __name__ == "__main__":
     model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module
 
-    # Create zeropower function with configurable coefficients
-    zeropower_fn = make_zeropower_fn(ns_a, ns_b, ns_c)
-
     # Optimizers: AdamW for lm_head (wd=0), Muon for transformer blocks (wd=1.2)
     optimizer_adamw = torch.optim.AdamW(
         raw_model.lm_head.parameters(),
         lr=learning_rate,
         betas=(0.9, 0.95),
         weight_decay=0.0,
-        fused=True
+        fused=True,
     )
     optimizer_muon = Muon(
         raw_model.transformer.h.parameters(),
         lr=muon_lr,
         momentum=0.95,
+        ns_coeffs=(ns_a, ns_b, ns_c),
         weight_decay=1.2,
-        zeropower_fn=zeropower_fn
     )
     optimizers = [optimizer_adamw, optimizer_muon]
     base_lrs = [learning_rate, muon_lr]
@@ -247,7 +186,7 @@ if __name__ == "__main__":
                 "ns_a": ns_a,
                 "ns_b": ns_b,
                 "ns_c": ns_c,
-            }
+            },
         )
 
     # Pre-fetch first batch
@@ -258,7 +197,7 @@ if __name__ == "__main__":
     prev_loss = None  # For loss-based LR scheduling
     for step in range(NUM_ITERATIONS + 1):
         t0 = time.time()
-        last_step = (step == NUM_ITERATIONS)
+        last_step = step == NUM_ITERATIONS
 
         # Validation
         if (VAL_LOSS_EVERY > 0 and step % VAL_LOSS_EVERY == 0) or last_step:
@@ -299,7 +238,10 @@ if __name__ == "__main__":
         train_loss /= grad_accum_steps
 
         # Compute gradient norm before optimizer step
-        grad_norm = sum(p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+        grad_norm = (
+            sum(p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None)
+            ** 0.5
+        )
 
         # Update learning rates and step
         # # ORIGINAL: step-based lr schedule
@@ -311,8 +253,8 @@ if __name__ == "__main__":
         # EXPERIMENTAL: loss-based lr schedule
         current_lr = get_lr_from_loss(prev_loss, learning_rate, L0)
         current_muon_lr = 0.1 * current_lr
-        optimizer_adamw.param_groups[0]['lr'] = current_lr
-        optimizer_muon.param_groups[0]['lr'] = current_muon_lr
+        optimizer_adamw.param_groups[0]["lr"] = current_lr
+        optimizer_muon.param_groups[0]["lr"] = current_muon_lr
         for opt in optimizers:
             opt.step()
 
@@ -328,18 +270,23 @@ if __name__ == "__main__":
             print0(f"step {step} | loss is NaN, stopping training")
             break
         prev_loss = lossf  # Update prev_loss for next step
-        print0(f"step {step:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | lr {current_lr:.2e} | {(t1-t0)*1000:.1f}ms")
+        print0(
+            f"step {step:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | lr {current_lr:.2e} | {(t1 - t0) * 1000:.1f}ms"
+        )
         if master_process:
             if logfile:
                 with open(logfile, "a") as f:
                     f.write(f"s:{step} trl:{lossf:.6f}\n")
             elapsed_min = (time.time() - start_time) / 60
-            wandb.log({
-                "train/loss": lossf,
-                "train/lr": current_lr,
-                "train/grad_norm": grad_norm.item(),
-                "train/elapsed_time_min": elapsed_min,
-            }, step=step)
+            wandb.log(
+                {
+                    "train/loss": lossf,
+                    "train/lr": current_lr,
+                    "train/grad_norm": grad_norm.item(),
+                    "train/elapsed_time_min": elapsed_min,
+                },
+                step=step,
+            )
 
     print0(f"Peak memory: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
     if master_process:

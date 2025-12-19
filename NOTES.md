@@ -1,7 +1,19 @@
 
-### Activate Env
 
-`source .venv/bin/activate`
+### Setup Env (from scratch)
+
+```bash
+uv venv                           # 创建 .venv 虚拟环境
+source .venv/bin/activate         # 激活环境
+uv pip sync requirements.txt      # 安装依赖
+pre-commit install                # 安装 pre-commit hooks
+```
+
+### Activate Env (already setup)
+
+```bash
+source .venv/bin/activate
+```
 
 ### Run Baseline
 
