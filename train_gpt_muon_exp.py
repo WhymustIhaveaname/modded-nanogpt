@@ -66,9 +66,18 @@ def build_data(args, ddp_rank, ddp_world_size):
 
 
 def build_model(args, ddp_local_rank):
-    """Build and compile model with DDP."""
-    model_config = GPTConfig(vocab_size=50257, n_layer=12, n_head=12, n_embd=768)
+    model_config = GPTConfig(
+        vocab_size=50257, n_layer=12, n_head=12, n_embd=768, tie_word_embeddings=True
+    )
     model = GPT(model_config)
+
+    if not model_config.tie_word_embeddings:
+        with torch.no_grad():
+            model.lm_head.weight.zero_()
+
+        for name, param in model.named_parameters():
+            print0(f"{name}: var={param.var().item():.6e}")
+
     model = model.train().cuda()
 
     if hasattr(config, "coordinate_descent_tuning"):
@@ -88,9 +97,11 @@ def build_optimizer_and_scheduler(args, model):
     muon_lr = 0.1 * learning_rate
     decay_start = args.decay_start
 
-    # Optimizers: AdamW for lm_head (wd=0), Muon for transformer blocks (wd=1.2)
+    adamw_params = list(raw_model.lm_head.parameters())
+    if not raw_model.config.tie_word_embeddings:
+        adamw_params += list(raw_model.transformer.wte.parameters())
     optimizer_adamw = torch.optim.AdamW(
-        raw_model.lm_head.parameters(),
+        adamw_params,
         lr=learning_rate,
         betas=(0.9, 0.95),
         weight_decay=0.0,
@@ -229,6 +240,16 @@ if __name__ == "__main__":
         adamw_lr = optimizers[0].param_groups[0]["lr"]
         muon_lr = optimizers[1].param_groups[0]["lr"]
         muon_wd = optimizers[1].param_groups[0]["weight_decay"]
+        opt0_params = sum(
+            p.numel() for g in optimizers[0].param_groups for p in g["params"]
+        )
+        opt1_params = sum(
+            p.numel() for g in optimizers[1].param_groups for p in g["params"]
+        )
+        model_params = sum(p.numel() for p in model.module.parameters())
+        assert opt0_params + opt1_params == model_params, (
+            f"optimizer params {opt0_params + opt1_params} != model params {model_params}"
+        )
         wandb.init(
             project="muon",
             name=args.run_name_full,
@@ -247,6 +268,9 @@ if __name__ == "__main__":
                 "ns_a": args.ns_a,
                 "ns_b": args.ns_b,
                 "ns_c": args.ns_c,
+                "opt0_params": opt0_params,
+                "opt1_params": opt1_params,
+                "model_params": model_params,
             },
         )
 

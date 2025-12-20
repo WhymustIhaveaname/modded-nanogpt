@@ -115,12 +115,11 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    """Configuration for GPT model."""
-
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    tie_word_embeddings: bool = False
 
 
 class GPT(nn.Module):
@@ -136,7 +135,13 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight  # weight tying
+        if config.tie_word_embeddings:
+            self.transformer.wte.weight = self.lm_head.weight
+
+        num_params = sum(p.numel() for p in self.parameters())
+        print(
+            f"GPT model: {num_params:,} parameters (tie_word_embeddings={config.tie_word_embeddings})"
+        )
 
     def forward(self, idx, targets=None):
         x = self.transformer.wte(idx)

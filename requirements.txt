@@ -1,8 +1,0 @@
-numpy
-tqdm
-huggingface-hub
-kernels
-setuptools
-pre-commit
-typing_extensions
-wandb
