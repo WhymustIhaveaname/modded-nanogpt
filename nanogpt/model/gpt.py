@@ -138,9 +138,15 @@ class GPT(nn.Module):
         if config.tie_word_embeddings:
             self.transformer.wte.weight = self.lm_head.weight
 
-        num_params = sum(p.numel() for p in self.parameters())
+        self.num_params = sum(p.numel() for p in self.parameters())
+        self.num_params_no_embd = sum(
+            p.numel()
+            for n, p in self.named_parameters()
+            if "wte" not in n and "lm_head" not in n
+        )
         print(
-            f"GPT model: {num_params:,} parameters (tie_word_embeddings={config.tie_word_embeddings})"
+            f"GPT model: {self.num_params:,} params, {self.num_params_no_embd:,} non-embd "
+            f"(tie_word_embeddings={config.tie_word_embeddings})"
         )
 
     def forward(self, idx, targets=None):

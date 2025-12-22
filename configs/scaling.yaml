@@ -1,0 +1,58 @@
+# Scaling Law Experiment Configuration
+# Run with: torchrun --standalone --nproc_per_node=8 train_scaling.py
+
+# Model configurations to sweep
+model:
+  vocab_size: 50257
+  tie_word_embeddings: false
+  # Each config is [n_layer, n_head], n_embd = n_head * head_dim
+  configs:
+    - [4, 4]
+    - [6, 6]
+    - [8, 8]
+    - [12, 12]
+  head_dim: 64
+
+# Training hyperparameters
+training:
+  batch_size: 64  # per GPU
+  sequence_length: 1024
+  total_batch_size: 524288  # total tokens per step
+
+  weight_decay: 0.1
+  val_loss_every: 128
+  val_max_steps: 20
+
+# optimizer:
+#   type: "AdamW"
+#   learning_rate: 0.0018
+#   beta1: 0.9
+#   beta2: 0.95
+#   num_iterations: 9537
+#   warmup_iters: 256
+#   warmdown_iters: 2048
+
+optimizer:
+  type: "Muon"
+  learning_rate: 0.0036
+  beta1: 0.9
+  beta2: 0.95
+  muon_lr_scale: 0.1
+  muon_momentum: 0.95
+  num_iterations: 6200
+  warmup_iters: 0
+  warmdown_iters: 1800
+
+# Data paths
+data:
+  train_files: "data/fineweb10B/fineweb_train_*.bin"
+  val_files: "data/fineweb10B/fineweb_val_*.bin"
+
+# Reproducibility
+seed: 42
+
+# Logging
+wandb:
+  project: "scaling-law"
+  run_name: "youran_1222_muon"
+  enabled: true

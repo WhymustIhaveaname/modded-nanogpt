@@ -29,6 +29,33 @@ GPU=$(python -c "import torch; print(torch.cuda.device_count())")
 torchrun --standalone --nproc_per_node=$GPU train_gpt_muon.py --run_name "debug_muon"
 ```
 
+### wandb_downloader
+
+从 wandb 下载指定 project 中匹配 regex 的 runs，合并所有 history 到一个 CSV 文件。
+
+**用法**
+
+```bash
+python x/wandb_downloader.py -p <project> -r <regex> [--output-dir <dir>] [--entity <entity>] [--host <host>]
+```
+
+**参数**
+- `-p, --project`: wandb 项目名（必填）
+- `-r, --regex`: 匹配 run name 的正则表达式（必填）
+- `--output-dir`: 输出目录，默认 `wandb_histories`
+- `--entity`: wandb entity，默认 `light-robo`
+- `--host`: wandb 服务器地址，默认 `https://ai.lrcorp.ai`
+
+**输出格式**
+
+输出一个 CSV 文件，文件名为 `<regex>.csv`。第一列 `tab` 标识每行属于哪个 run，后续列为该 run 的 history 数据。
+
+| tab | _step | loss | ... |
+|-----|-------|------|-----|
+| run_name_1 | 0 | 10.5 | ... |
+| run_name_1 | 1 | 9.8 | ... |
+| run_name_2 | 0 | 11.2 | ... |
+
 ## Code Style
 
 ### Pre-commit Requirements

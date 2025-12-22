@@ -8,3 +8,4 @@ logs/
 wandb/*
 wandb_histories/*
 x/outputs/*
+outputs/

@@ -12,10 +12,12 @@ dependencies = [
     "typing_extensions",
     "wandb",
     "pandas",
+    "openpyxl",
     "matplotlib",
     "torch==2.11.0.dev20251218+cu126",
     "scipy",
     "ray",
+    "hydra-core>=1.3.0",
 ]
 
 [tool.uv]

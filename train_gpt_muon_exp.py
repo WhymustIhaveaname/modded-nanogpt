@@ -229,6 +229,18 @@ if __name__ == "__main__":
     model = build_model(args, ddp_local_rank)
     optimizers, base_lrs, get_lr_scale = build_optimizer_and_scheduler(args, model)
 
+    # Verify optimizer parameter coverage (all ranks)
+    opt0_params = sum(
+        p.numel() for g in optimizers[0].param_groups for p in g["params"]
+    )
+    opt1_params = sum(
+        p.numel() for g in optimizers[1].param_groups for p in g["params"]
+    )
+    model_params = sum(p.numel() for p in model.module.parameters())
+    assert opt0_params + opt1_params == model_params, (
+        f"optimizer params {opt0_params + opt1_params} != model params {model_params}"
+    )
+
     # Logging
     run_id = str(uuid.uuid4())
     logfile = None
@@ -240,16 +252,6 @@ if __name__ == "__main__":
         adamw_lr = optimizers[0].param_groups[0]["lr"]
         muon_lr = optimizers[1].param_groups[0]["lr"]
         muon_wd = optimizers[1].param_groups[0]["weight_decay"]
-        opt0_params = sum(
-            p.numel() for g in optimizers[0].param_groups for p in g["params"]
-        )
-        opt1_params = sum(
-            p.numel() for g in optimizers[1].param_groups for p in g["params"]
-        )
-        model_params = sum(p.numel() for p in model.module.parameters())
-        assert opt0_params + opt1_params == model_params, (
-            f"optimizer params {opt0_params + opt1_params} != model params {model_params}"
-        )
         wandb.init(
             project="muon",
             name=args.run_name_full,
