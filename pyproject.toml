@@ -1,7 +1,7 @@
 [project]
 name = "modded-nanogpt"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "numpy",
     "tqdm",
@@ -14,6 +14,8 @@ dependencies = [
     "pandas",
     "matplotlib",
     "torch==2.11.0.dev20251218+cu126",
+    "scipy",
+    "ray",
 ]
 
 [tool.uv]
